@@ -39,7 +39,7 @@ def register_extensions(app: Flask) -> None:
     jwt.init_app(app)
     mail.init_app(app)
     bcrypt.init_app(app)
-    cors.init_app(app, resources={r"/api/*": {"origins": app.config["FRONTEND_URL"]}})
+    cors.init_app(app, resources={r"/api/*": {"origins": "*"}})
 
 
 def register_blueprints(app: Flask) -> None:

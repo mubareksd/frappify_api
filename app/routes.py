@@ -32,6 +32,7 @@ api_bp = Blueprint("api", __name__)
 ALLOWED_PROXY_PREFIXES = (
     "/method",
     "/resource",
+    "/assets",
     "/v1/method",
     "/v1/resource",
     "/v2/method",
@@ -78,6 +79,11 @@ def _build_proxy_headers() -> dict:
 def _is_frappe_login_path(path: str) -> bool:
     normalized_path = f"/{path.lstrip('/')}"
     return normalized_path in FRAPPE_LOGIN_PATHS
+
+
+def _is_asset_proxy_path(path: str) -> bool:
+    normalized_path = f"/{path.lstrip('/')}"
+    return normalized_path == "/assets" or normalized_path.startswith("/assets/")
 
 
 def _parse_cookie_expiration(morsel) -> datetime | None:
@@ -237,8 +243,9 @@ def login():
         jsonify(
             {
                 "access_token": access_token,
+                "access_token_expires_in": 15 * 60,  # 15 minutes
                 "refresh_token": refresh_token,
-                "token_type": "Bearer",
+                "refresh_token_expires_in": 7 * 24 * 60 * 60,  # 7 days
                 "user": {
                     "id": user.id,
                     "username": user.username,
@@ -255,7 +262,7 @@ def login():
 @jwt_required(refresh=True)
 def refresh():
     access_token = create_access_token(identity=get_jwt_identity())
-    return jsonify({"access_token": access_token, "token_type": "Bearer"}), HTTPStatus.OK
+    return jsonify({"access_token": access_token, "access_token_expires_in": 15 * 60}), HTTPStatus.OK
 
 
 @api_bp.post("/auth/forgot-password")
@@ -408,7 +415,10 @@ def proxy_request(path: str):
     g.log_site_id = site.site_id
 
     proxied_path = path.lstrip("/")
-    upstream_url = f"{site.base_url.rstrip('/')}/api/{proxied_path}"
+    if _is_asset_proxy_path(path):
+        upstream_url = f"{site.base_url.rstrip('/')}/{proxied_path}"
+    else:
+        upstream_url = f"{site.base_url.rstrip('/')}/api/{proxied_path}"
     if request.query_string:
         upstream_url = f"{upstream_url}?{request.query_string.decode()}"
 
