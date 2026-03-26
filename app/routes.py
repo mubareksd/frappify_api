@@ -181,8 +181,8 @@ def register():
     db.session.add(user)
     db.session.commit()
 
-    token = generate_email_verification_token(user.id)
-    send_verification_email(user.email, token)
+    # token = generate_email_verification_token(user.id)
+    # send_verification_email(user.email, token)
 
     return (
         jsonify(
