@@ -21,7 +21,11 @@ class Config:
         "postgresql+psycopg2://postgres:postgres@localhost:5432/frappe_proxy",
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
-    FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        "pool_pre_ping": True,
+        "pool_recycle": int(os.getenv("SQLALCHEMY_POOL_RECYCLE_SECONDS", "1800")),
+        "pool_timeout": int(os.getenv("SQLALCHEMY_POOL_TIMEOUT_SECONDS", "30")),
+    }
 
     MAIL_SERVER = os.getenv("MAIL_SERVER", "localhost")
     MAIL_PORT = int(os.getenv("MAIL_PORT", "1025"))

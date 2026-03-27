@@ -47,17 +47,32 @@ def test_create_site_adds_new_site_for_logged_in_user(app, client, session):
     response = client.post(
         "/api/sites",
         headers=auth_headers(app, user.id),
-        json={"site_id": "C00012", "base_url": "https://create.example.com"},
+        json={"base_url": "https://create.example.com"},
     )
 
     assert response.status_code == 201
     data = response.get_json()
-    assert data["site"]["site_id"] == "C00012"
+    assert data["site"]["site_id"] == "C00001"
     assert data["site"]["base_url"] == "https://create.example.com"
     assert data["site"]["user_id"] == user.id
 
-    saved_site = session.query(Site).filter_by(site_id="C00012").one()
+    saved_site = session.query(Site).filter_by(site_id="C00001").one()
     assert saved_site.user_id == user.id
+
+
+def test_create_site_ignores_client_supplied_site_id(app, client, session):
+    user = create_user(session, "generatedsite")
+
+    response = client.post(
+        "/api/sites",
+        headers=auth_headers(app, user.id),
+        json={"site_id": "C99999", "base_url": "https://ignore.example.com"},
+    )
+
+    assert response.status_code == 201
+    data = response.get_json()
+    assert data["site"]["site_id"] == "C00001"
+    assert data["site"]["site_id"] != "C99999"
 
 
 def test_update_site_edits_logged_in_user_site(app, client, session):
@@ -69,7 +84,7 @@ def test_update_site_edits_logged_in_user_site(app, client, session):
     response = client.put(
         "/api/sites/C00013",
         headers=auth_headers(app, user.id),
-        json={"site_id": "C00013", "base_url": "https://after.example.com"},
+        json={"base_url": "https://after.example.com"},
     )
 
     assert response.status_code == 200
@@ -78,6 +93,25 @@ def test_update_site_edits_logged_in_user_site(app, client, session):
 
     updated_site = session.query(Site).filter_by(site_id="C00013").one()
     assert updated_site.base_url == "https://after.example.com"
+
+
+def test_update_site_rejects_site_id_changes(app, client, session):
+    user = create_user(session, "siteimmutability")
+    site = Site(site_id="C00016", base_url="https://stable.example.com", user_id=user.id)
+    session.add(site)
+    session.commit()
+
+    response = client.put(
+        "/api/sites/C00016",
+        headers=auth_headers(app, user.id),
+        json={"site_id": "C12345", "base_url": "https://changed.example.com"},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "site_id cannot be modified"
+
+    unchanged_site = session.query(Site).filter_by(site_id="C00016").one()
+    assert unchanged_site.base_url == "https://stable.example.com"
 
 
 def test_delete_site_removes_logged_in_user_site(app, client, session):
@@ -105,17 +139,18 @@ def test_site_routes_store_request_response_logs(app, client, session):
             **auth_headers(app, user.id),
             "X-Test-Header": "site-log-check",
         },
-        json={"site_id": "C00015", "base_url": "https://log.example.com"},
+        json={"base_url": "https://log.example.com"},
     )
 
     assert response.status_code == 201
+    created_site = response.get_json()["site"]
 
     log_entry = session.query(Log).order_by(Log.id.desc()).first()
     assert log_entry is not None
     assert log_entry.method == "POST"
     assert log_entry.path == "/api/sites"
     assert log_entry.response_status == 201
-    assert log_entry.site_id == "C00015"
+    assert log_entry.site_id == created_site["site_id"]
     assert log_entry.user_id == user.id
     assert log_entry.headers["X-Test-Header"] == "site-log-check"
     assert log_entry.timestamp is not None

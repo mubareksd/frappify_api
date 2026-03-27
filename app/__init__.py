@@ -1,5 +1,6 @@
 from flask import Flask, app, g, jsonify, request
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
+from sqlalchemy.exc import SQLAlchemyError
 
 from .config import Config
 from .extensions import bcrypt, cors, db, jwt, mail, migrate
@@ -102,15 +103,27 @@ def register_request_logging(app: Flask) -> None:
         if not getattr(g, "should_log_request", False):
             return response
 
+        log_site_id = getattr(g, "log_site_id", None)
+        if log_site_id is None:
+            return response
+
         log_entry = Log(
             method=request.method,
             path=request.full_path.rstrip("?"),
             headers=dict(request.headers),
             response_status=response.status_code,
-            site_id=getattr(g, "log_site_id", None),
+            site_id=log_site_id,
             user_id=getattr(g, "log_user_id", None),
         )
-        db.session.add(log_entry)
-        db.session.commit()
+        try:
+            db.session.add(log_entry)
+            db.session.commit()
+        except SQLAlchemyError:
+            db.session.rollback()
 
         return response
+
+    @app.teardown_request
+    def rollback_session_on_exception(exc):
+        if exc is not None:
+            db.session.rollback()

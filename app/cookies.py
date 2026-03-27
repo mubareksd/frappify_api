@@ -17,7 +17,7 @@ def store_cookie(site_id: int, cookie: dict) -> Cookie:
 
     existing_cookie = Cookie.query.filter_by(
         site_id=site_id,
-        cookie_name=cookie["cookie_name"],
+        cookie_value=cookie["cookie_value"],
     ).first()
 
     if existing_cookie is None:

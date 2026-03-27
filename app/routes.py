@@ -14,6 +14,7 @@ from flask_jwt_extended import (
     jwt_required,
     verify_jwt_in_request,
 )
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from .auth import (
     generate_email_verification_token,
@@ -56,6 +57,23 @@ def _serialize_site(site: Site) -> dict:
         "created_at": site.created_at.isoformat(),
         "updated_at": site.updated_at.isoformat(),
     }
+
+
+def _generate_site_id() -> str:
+    latest_site = (
+        Site.query.filter(Site.site_id.like("C_____"))
+        .order_by(Site.site_id.desc())
+        .first()
+    )
+    if latest_site is None:
+        return "C00001"
+
+    try:
+        next_value = int(latest_site.site_id[1:]) + 1
+    except (TypeError, ValueError):
+        next_value = 1
+
+    return f"C{next_value:05d}"
 
 
 def _is_allowed_proxy_path(path: str) -> bool:
@@ -329,23 +347,26 @@ def list_sites():
 def create_site():
     user_id = int(get_jwt_identity())
     payload = request.get_json(silent=True) or {}
-    site_id = payload.get("site_id")
     base_url = payload.get("base_url")
 
-    if not site_id or not base_url:
-        return (
-            jsonify({"error": "site_id and base_url are required"}),
-            HTTPStatus.BAD_REQUEST,
-        )
+    if not base_url:
+        return jsonify({"error": "base_url is required"}), HTTPStatus.BAD_REQUEST
 
-    existing_site = Site.query.filter_by(site_id=site_id).first()
-    if existing_site is not None:
-        return jsonify({"error": "A site with that site_id already exists"}), HTTPStatus.CONFLICT
+    site = None
+    for _ in range(5):
+        site = Site(site_id=_generate_site_id(), base_url=base_url, user_id=user_id)
+        db.session.add(site)
+        try:
+            db.session.commit()
+            break
+        except IntegrityError:
+            db.session.rollback()
+            site = None
 
-    site = Site(site_id=site_id, base_url=base_url, user_id=user_id)
-    db.session.add(site)
-    db.session.commit()
-    g.log_site_id = site.site_id
+    if site is None:
+        return jsonify({"error": "Unable to generate a unique site_id"}), HTTPStatus.INTERNAL_SERVER_ERROR
+
+    g.log_site_id = site.id
 
     return jsonify({"site": _serialize_site(site)}), HTTPStatus.CREATED
 
@@ -357,29 +378,20 @@ def update_site(site_id: str):
     site = Site.query.filter_by(site_id=site_id, user_id=user_id).first()
     if site is None:
         return jsonify({"error": "Site not found"}), HTTPStatus.NOT_FOUND
-    g.log_site_id = site.site_id
+    g.log_site_id = site.id
 
     payload = request.get_json(silent=True) or {}
-    next_site_id = payload.get("site_id", site.site_id)
     next_base_url = payload.get("base_url", site.base_url)
 
-    if not next_site_id or not next_base_url:
-        return (
-            jsonify({"error": "site_id and base_url are required"}),
-            HTTPStatus.BAD_REQUEST,
-        )
+    if payload.get("site_id") not in (None, site.site_id):
+        return jsonify({"error": "site_id cannot be modified"}), HTTPStatus.BAD_REQUEST
 
-    duplicate_site = Site.query.filter(
-        Site.site_id == next_site_id,
-        Site.id != site.id,
-    ).first()
-    if duplicate_site is not None:
-        return jsonify({"error": "A site with that site_id already exists"}), HTTPStatus.CONFLICT
+    if not next_base_url:
+        return jsonify({"error": "base_url is required"}), HTTPStatus.BAD_REQUEST
 
-    site.site_id = next_site_id
     site.base_url = next_base_url
     db.session.commit()
-    g.log_site_id = site.site_id
+    g.log_site_id = site.id
 
     return jsonify({"site": _serialize_site(site)}), HTTPStatus.OK
 
@@ -391,7 +403,7 @@ def delete_site(site_id: str):
     site = Site.query.filter_by(site_id=site_id, user_id=user_id).first()
     if site is None:
         return jsonify({"error": "Site not found"}), HTTPStatus.NOT_FOUND
-    g.log_site_id = site.site_id
+    g.log_site_id = site.id
 
     db.session.delete(site)
     db.session.commit()
@@ -409,10 +421,22 @@ def proxy_request(path: str):
     if not target_site_id:
         return jsonify({"error": "X-Frappe-Site header is required"}), HTTPStatus.BAD_REQUEST
 
-    site = Site.query.filter_by(site_id=target_site_id).first()
+    site = None
+    for attempt in range(2):
+        try:
+            site = Site.query.filter_by(site_id=target_site_id).first()
+            break
+        except OperationalError:
+            db.session.rollback()
+            if attempt == 1:
+                return (
+                    jsonify({"error": "Database unavailable. Please try again."}),
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+
     if site is None:
         return jsonify({"error": "Site not found"}), HTTPStatus.NOT_FOUND
-    g.log_site_id = site.site_id
+    g.log_site_id = site.id
 
     proxied_path = path.lstrip("/")
     if _is_asset_proxy_path(path):
