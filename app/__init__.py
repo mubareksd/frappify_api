@@ -111,6 +111,8 @@ def register_request_logging(app: Flask) -> None:
             method=request.method,
             path=request.full_path.rstrip("?"),
             headers=dict(request.headers),
+            ip_address=request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip(),
+            mac_address=request.headers.get("X-Forwarded-Mac", None),
             response_status=response.status_code,
             site_id=log_site_id,
             user_id=getattr(g, "log_user_id", None),

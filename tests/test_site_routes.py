@@ -75,6 +75,20 @@ def test_create_site_ignores_client_supplied_site_id(app, client, session):
     assert data["site"]["site_id"] != "C99999"
 
 
+def test_create_site_rejects_malformed_json(app, client, session):
+    user = create_user(session, "badjson")
+
+    response = client.post(
+        "/api/sites",
+        headers=auth_headers(app, user.id),
+        data='{"base_url":"https://bad-json.example.com",}',
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "Invalid JSON body"
+
+
 def test_update_site_edits_logged_in_user_site(app, client, session):
     user = create_user(session, "editor")
     site = Site(site_id="C00013", base_url="https://before.example.com", user_id=user.id)

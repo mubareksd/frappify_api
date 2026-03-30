@@ -1,6 +1,7 @@
 from http import HTTPStatus
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from fnmatch import fnmatchcase
 from http.cookies import SimpleCookie
 from typing import Tuple
 from urllib.parse import urlparse
@@ -26,7 +27,7 @@ from .auth import (
 )
 from .cookies import get_valid_cookie_by_id, store_cookie
 from .extensions import db
-from .models import Cookie, Log, Site, User
+from .models import Cookie, IpFilter, Log, MacFilter, Site, User
 
 
 api_bp = Blueprint("api", __name__)
@@ -102,6 +103,22 @@ def _is_frappe_login_path(path: str) -> bool:
 def _is_asset_proxy_path(path: str) -> bool:
     normalized_path = f"/{path.lstrip('/')}"
     return normalized_path == "/assets" or normalized_path.startswith("/assets/")
+
+
+def _matches_filter_pattern(value: str, pattern: str, *, case_sensitive: bool = True) -> bool:
+    if not value or not pattern:
+        return False
+
+    normalized_value = value.strip()
+    normalized_pattern = pattern.strip()
+    if not normalized_value or not normalized_pattern:
+        return False
+
+    if not case_sensitive:
+        normalized_value = normalized_value.lower()
+        normalized_pattern = normalized_pattern.lower()
+
+    return fnmatchcase(normalized_value, normalized_pattern)
 
 
 def _parse_cookie_expiration(morsel) -> datetime | None:
@@ -346,15 +363,29 @@ def list_sites():
 @jwt_required()
 def create_site():
     user_id = int(get_jwt_identity())
-    payload = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=False)
+    if payload is None:
+        return jsonify({"error": "Invalid JSON body"}), HTTPStatus.BAD_REQUEST
+    if not isinstance(payload, dict):
+        return jsonify({"error": "JSON body must be an object"}), HTTPStatus.BAD_REQUEST
+
     base_url = payload.get("base_url")
+    enable_ip_filter = payload.get("enable_ip_filter", False)
+    enable_mac_filter = payload.get("enable_mac_filter", False)
+    ip_filter_mode = payload.get("ip_filter_mode", "whitelist")
+    mac_filter_mode = payload.get("mac_filter_mode", "whitelist")
+    ip_filters = payload.get("ip_filters", [])
+    mac_filters = payload.get("mac_filters", [])
+
 
     if not base_url:
         return jsonify({"error": "base_url is required"}), HTTPStatus.BAD_REQUEST
 
     site = None
     for _ in range(5):
-        site = Site(site_id=_generate_site_id(), base_url=base_url, user_id=user_id)
+        site = Site(
+            site_id=_generate_site_id(), base_url=base_url, user_id=user_id, enable_ip_filter=enable_ip_filter, enable_mac_filter=enable_mac_filter, ip_filter_mode=ip_filter_mode, mac_filter_mode=mac_filter_mode
+        )
         db.session.add(site)
         try:
             db.session.commit()
@@ -365,7 +396,15 @@ def create_site():
 
     if site is None:
         return jsonify({"error": "Unable to generate a unique site_id"}), HTTPStatus.INTERNAL_SERVER_ERROR
+    
+    if enable_ip_filter:
+        for ip in ip_filters:
+            site.ip_filters.append(IpFilter(ip_address=ip))
 
+    if enable_mac_filter:
+        for mac in mac_filters:
+            site.mac_filters.append(MacFilter(mac_address=mac))
+    db.session.commit()
     g.log_site_id = site.id
 
     return jsonify({"site": _serialize_site(site)}), HTTPStatus.CREATED
@@ -437,6 +476,35 @@ def proxy_request(path: str):
     if site is None:
         return jsonify({"error": "Site not found"}), HTTPStatus.NOT_FOUND
     g.log_site_id = site.id
+    
+    if site.enable_ip_filter:
+        client_ip=request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+        if not client_ip:
+            return jsonify({"error": "Unable to determine client IP address"}), HTTPStatus.BAD_REQUEST
+
+        ip_filter_mode = site.ip_filter_mode or "whitelist"
+        ip_filter_exists = any(
+            (_matches_filter_pattern(client_ip, ip_filter.ip_address) for ip_filter in site.ip_filters)
+        )
+
+        if (ip_filter_mode == "whitelist" and not ip_filter_exists) or (ip_filter_mode == "blacklist" and ip_filter_exists):
+            return jsonify({"error": "Access denied due to IP filter rules"}), HTTPStatus.FORBIDDEN
+
+    if site.enable_mac_filter:
+        client_mac=request.headers.get("X-Forwarded-Mac", None)
+        if not client_mac:
+            return jsonify({"error": "Unable to determine client MAC address"}), HTTPStatus.BAD_REQUEST
+
+        mac_filter_mode = site.mac_filter_mode or "whitelist"
+        mac_filter_exists = any(
+            (
+                _matches_filter_pattern(client_mac, mac_filter.mac_address, case_sensitive=False)
+                for mac_filter in site.mac_filters
+            )
+        )
+
+        if (mac_filter_mode == "whitelist" and not mac_filter_exists) or (mac_filter_mode == "blacklist" and mac_filter_exists):
+            return jsonify({"error": "Access denied due to MAC filter rules"}), HTTPStatus.FORBIDDEN
 
     proxied_path = path.lstrip("/")
     if _is_asset_proxy_path(path):
