@@ -1,3 +1,4 @@
+
 from http import HTTPStatus
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -27,7 +28,7 @@ from .auth import (
 )
 from .cookies import get_valid_cookie_by_id, store_cookie
 from .extensions import db
-from .models import Cookie, IpFilter, Log, MacFilter, Site, User
+from .models import Cookie, IpFilter, Log, Site, User
 
 
 api_bp = Blueprint("api", __name__)
@@ -55,6 +56,9 @@ def _serialize_site(site: Site) -> dict:
         "site_id": site.site_id,
         "base_url": site.base_url,
         "user_id": site.user_id,
+        "enable_ip_filter": site.enable_ip_filter,
+        "ip_filter_mode": site.ip_filter_mode,
+        "ip_filters": [f.ip_address for f in site.ip_filters],
         "created_at": site.created_at.isoformat(),
         "updated_at": site.updated_at.isoformat(),
     }
@@ -75,6 +79,27 @@ def _generate_site_id() -> str:
         next_value = 1
 
     return f"C{next_value:05d}"
+
+
+def _parse_pagination_params() -> tuple[int, int]:
+    try:
+        page = int(request.args.get("page", "1"))
+    except ValueError:
+        page = 1
+
+    try:
+        page_size = int(request.args.get("page_size", "20"))
+    except ValueError:
+        page_size = 20
+
+    page = max(1, page)
+    page_size = min(max(1, page_size), 100)
+    return page, page_size
+
+
+def _parse_sort_direction() -> str:
+    sort_dir = (request.args.get("sort_dir", "desc") or "desc").lower()
+    return "asc" if sort_dir == "asc" else "desc"
 
 
 def _is_allowed_proxy_path(path: str) -> bool:
@@ -351,12 +376,156 @@ def reset_password():
     return jsonify({"message": "Password reset successfully"}), HTTPStatus.OK
 
 
+@api_bp.get("/sites/<string:site_id>/logs")
+@jwt_required()
+def list_site_logs(site_id: str):
+    user_id = int(get_jwt_identity())
+    site = Site.query.filter_by(site_id=site_id, user_id=user_id).first()
+    if site is None:
+        return jsonify({"error": "Site not found"}), HTTPStatus.NOT_FOUND
+
+    page, page_size = _parse_pagination_params()
+    offset = (page - 1) * page_size
+
+    search = (request.args.get("search", "") or "").strip()
+    method = (request.args.get("method", "") or "").strip().upper()
+    status = (request.args.get("status", "") or "").strip()
+    sort_by = (request.args.get("sort_by", "timestamp") or "timestamp").strip().lower()
+    sort_dir = _parse_sort_direction()
+
+    allowed_sort_columns = {
+        "timestamp": Log.timestamp,
+        "method": Log.method,
+        "path": Log.path,
+        "ip_address": Log.ip_address,
+        "response_status": Log.response_status,
+    }
+    sort_column = allowed_sort_columns.get(sort_by, Log.timestamp)
+    if sort_by not in allowed_sort_columns:
+        sort_by = "timestamp"
+
+    query = Log.query.filter_by(site_id=site.id)
+
+    if search:
+        like_pattern = f"%{search}%"
+        query = query.filter(
+            (Log.path.ilike(like_pattern))
+            | (Log.ip_address.ilike(like_pattern))
+            | (Log.method.ilike(like_pattern))
+        )
+
+    if method:
+        query = query.filter(Log.method == method)
+
+    if status:
+        try:
+            query = query.filter(Log.response_status == int(status))
+        except ValueError:
+            return jsonify({"error": "status must be a valid integer"}), HTTPStatus.BAD_REQUEST
+
+    total = query.count()
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    if sort_dir == "asc":
+        query = query.order_by(sort_column.asc(), Log.id.asc())
+    else:
+        query = query.order_by(sort_column.desc(), Log.id.desc())
+
+    logs = query.offset(offset).limit(page_size).all()
+
+    def serialize_log(log):
+        return {
+            "id": log.id,
+            "timestamp": log.timestamp.isoformat() if log.timestamp else None,
+            "method": log.method,
+            "path": log.path,
+            "headers": log.headers,
+            "ip_address": log.ip_address,
+            "response_status": log.response_status,
+            "user_id": log.user_id,
+        }
+
+    return (
+        jsonify(
+            {
+                "logs": [serialize_log(log) for log in logs],
+                "meta": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "total_pages": total_pages,
+                    "sort_by": sort_by,
+                    "sort_dir": sort_dir,
+                    "search": search,
+                    "method": method,
+                    "status": status,
+                },
+            }
+        ),
+        HTTPStatus.OK,
+    )
+
 @api_bp.get("/sites")
 @jwt_required()
 def list_sites():
     user_id = int(get_jwt_identity())
-    sites = Site.query.filter_by(user_id=user_id).order_by(Site.id.asc()).all()
-    return jsonify({"sites": [_serialize_site(site) for site in sites]}), HTTPStatus.OK
+    page, page_size = _parse_pagination_params()
+    offset = (page - 1) * page_size
+
+    search = (request.args.get("search", "") or "").strip()
+    enable_ip_filter = (request.args.get("enable_ip_filter", "") or "").strip().lower()
+    sort_by = (request.args.get("sort_by", "id") or "id").strip().lower()
+    sort_dir = _parse_sort_direction()
+
+    allowed_sort_columns = {
+        "id": Site.id,
+        "site_id": Site.site_id,
+        "base_url": Site.base_url,
+        "created_at": Site.created_at,
+        "updated_at": Site.updated_at,
+    }
+    sort_column = allowed_sort_columns.get(sort_by, Site.id)
+    if sort_by not in allowed_sort_columns:
+        sort_by = "id"
+
+    query = Site.query.filter_by(user_id=user_id)
+
+    if search:
+        like_pattern = f"%{search}%"
+        query = query.filter(
+            (Site.site_id.ilike(like_pattern)) | (Site.base_url.ilike(like_pattern))
+        )
+
+    if enable_ip_filter in {"true", "false"}:
+        query = query.filter(Site.enable_ip_filter == (enable_ip_filter == "true"))
+
+    total = query.count()
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    if sort_dir == "asc":
+        query = query.order_by(sort_column.asc(), Site.id.asc())
+    else:
+        query = query.order_by(sort_column.desc(), Site.id.desc())
+
+    sites = query.offset(offset).limit(page_size).all()
+    return (
+        jsonify(
+            {
+                "sites": [_serialize_site(site) for site in sites],
+                "meta": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "total_pages": total_pages,
+                    "sort_by": sort_by,
+                    "sort_dir": sort_dir,
+                    "search": search,
+                    "enable_ip_filter": enable_ip_filter,
+                },
+            }
+        ),
+        HTTPStatus.OK,
+    )
 
 
 @api_bp.post("/sites")
@@ -371,11 +540,8 @@ def create_site():
 
     base_url = payload.get("base_url")
     enable_ip_filter = payload.get("enable_ip_filter", False)
-    enable_mac_filter = payload.get("enable_mac_filter", False)
     ip_filter_mode = payload.get("ip_filter_mode", "whitelist")
-    mac_filter_mode = payload.get("mac_filter_mode", "whitelist")
     ip_filters = payload.get("ip_filters", [])
-    mac_filters = payload.get("mac_filters", [])
 
 
     if not base_url:
@@ -384,7 +550,7 @@ def create_site():
     site = None
     for _ in range(5):
         site = Site(
-            site_id=_generate_site_id(), base_url=base_url, user_id=user_id, enable_ip_filter=enable_ip_filter, enable_mac_filter=enable_mac_filter, ip_filter_mode=ip_filter_mode, mac_filter_mode=mac_filter_mode
+            site_id=_generate_site_id(), base_url=base_url, user_id=user_id, enable_ip_filter=enable_ip_filter, ip_filter_mode=ip_filter_mode
         )
         db.session.add(site)
         try:
@@ -401,9 +567,6 @@ def create_site():
         for ip in ip_filters:
             site.ip_filters.append(IpFilter(ip_address=ip))
 
-    if enable_mac_filter:
-        for mac in mac_filters:
-            site.mac_filters.append(MacFilter(mac_address=mac))
     db.session.commit()
     g.log_site_id = site.id
 
@@ -429,6 +592,16 @@ def update_site(site_id: str):
         return jsonify({"error": "base_url is required"}), HTTPStatus.BAD_REQUEST
 
     site.base_url = next_base_url
+
+    if "enable_ip_filter" in payload:
+        site.enable_ip_filter = bool(payload["enable_ip_filter"])
+    if "ip_filter_mode" in payload:
+        site.ip_filter_mode = payload["ip_filter_mode"]
+    if "ip_filters" in payload:
+        site.ip_filters.clear()
+        for ip in payload["ip_filters"]:
+            site.ip_filters.append(IpFilter(ip_address=ip))
+
     db.session.commit()
     g.log_site_id = site.id
 
@@ -489,22 +662,6 @@ def proxy_request(path: str):
 
         if (ip_filter_mode == "whitelist" and not ip_filter_exists) or (ip_filter_mode == "blacklist" and ip_filter_exists):
             return jsonify({"error": "Access denied due to IP filter rules"}), HTTPStatus.FORBIDDEN
-
-    if site.enable_mac_filter:
-        client_mac=request.headers.get("X-Forwarded-Mac", None)
-        if not client_mac:
-            return jsonify({"error": "Unable to determine client MAC address"}), HTTPStatus.BAD_REQUEST
-
-        mac_filter_mode = site.mac_filter_mode or "whitelist"
-        mac_filter_exists = any(
-            (
-                _matches_filter_pattern(client_mac, mac_filter.mac_address, case_sensitive=False)
-                for mac_filter in site.mac_filters
-            )
-        )
-
-        if (mac_filter_mode == "whitelist" and not mac_filter_exists) or (mac_filter_mode == "blacklist" and mac_filter_exists):
-            return jsonify({"error": "Access denied due to MAC filter rules"}), HTTPStatus.FORBIDDEN
 
     proxied_path = path.lstrip("/")
     if _is_asset_proxy_path(path):
