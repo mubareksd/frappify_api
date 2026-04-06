@@ -1,9 +1,9 @@
-from flask import Flask, app, g, jsonify, request
+from flask import Flask, g, jsonify, request
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 from sqlalchemy.exc import SQLAlchemyError
 
 from .config import Config
-from .extensions import bcrypt, cors, db, jwt, mail, migrate
+from .extensions import bcrypt, cors, db, jwt, mail, migrate, sock
 from . import models
 from .models import Log
 from .rate_limiter import rate_limiter
@@ -40,6 +40,7 @@ def register_extensions(app: Flask) -> None:
     jwt.init_app(app)
     mail.init_app(app)
     bcrypt.init_app(app)
+    sock.init_app(app)
     cors.init_app(app, resources={r"/api/*": {"origins": "*"}})
 
 
@@ -48,25 +49,68 @@ def register_blueprints(app: Flask) -> None:
 
 
 def register_rate_limiting(app: Flask) -> None:
+    def _extract_client_ip() -> str:
+        for header_name in ("X-Forwarded-For", "X-Real-IP"):
+            header_value = request.headers.get(header_name)
+            if header_value:
+                return header_value.split(",")[0].strip()
+        return (request.remote_addr or "unknown").strip()
+
+    def _is_exempt_path(path: str) -> bool:
+        exempt_paths = app.config.get("RATE_LIMIT_EXEMPT_PATHS", ())
+        return any(path == prefix or path.startswith(f"{prefix}/") for prefix in exempt_paths)
+
+    def _rate_limit_key() -> str:
+        strategy = app.config.get("RATE_LIMIT_KEY_STRATEGY", "ip")
+        client_ip = _extract_client_ip()
+        if strategy == "ip-path":
+            return f"{client_ip}:{request.path}"
+        return client_ip
+
     @app.before_request
     def enforce_rate_limit():
         if not app.config["RATE_LIMIT_ENABLED"]:
             return None
         if not request.path.startswith("/api"):
             return None
+        if _is_exempt_path(request.path):
+            return None
 
-        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
-        client_ip = client_ip.split(",")[0].strip()
-
-        allowed = rate_limiter.allow(
-            client_ip,
+        decision = rate_limiter.evaluate(
+            _rate_limit_key(),
             app.config["RATE_LIMIT_REQUESTS"],
             app.config["RATE_LIMIT_WINDOW_SECONDS"],
         )
-        if allowed:
+        g.rate_limit_limit = decision.limit
+        g.rate_limit_remaining = decision.remaining
+
+        if decision.allowed:
             return None
 
-        return jsonify({"error": "Too Many Requests"}), 429
+        response = jsonify({"error": "Too Many Requests"})
+        response.status_code = 429
+        response.headers["Retry-After"] = str(decision.retry_after_seconds)
+        response.headers["X-RateLimit-Limit"] = str(decision.limit)
+        response.headers["X-RateLimit-Remaining"] = "0"
+        return response
+
+    @app.after_request
+    def add_rate_limit_headers(response):
+        if not app.config["RATE_LIMIT_ENABLED"]:
+            return response
+        if not request.path.startswith("/api"):
+            return response
+        if _is_exempt_path(request.path):
+            return response
+
+        limit = getattr(g, "rate_limit_limit", None)
+        remaining = getattr(g, "rate_limit_remaining", None)
+        if limit is None or remaining is None:
+            return response
+
+        response.headers["X-RateLimit-Limit"] = str(limit)
+        response.headers["X-RateLimit-Remaining"] = str(remaining)
+        return response
 
 
 def register_request_logging(app: Flask) -> None:

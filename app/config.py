@@ -43,6 +43,14 @@ class Config:
     RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "True").lower() == "true"
     RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
     RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+    RATE_LIMIT_KEY_STRATEGY = os.getenv("RATE_LIMIT_KEY_STRATEGY", "ip").lower()
+    RATE_LIMIT_EXEMPT_PATHS = tuple(
+        segment.strip()
+        for segment in os.getenv("RATE_LIMIT_EXEMPT_PATHS", "/api/health").split(",")
+        if segment.strip()
+    )
+    WEBSOCKET_PROXY_ENABLED = os.getenv("WEBSOCKET_PROXY_ENABLED", "True").lower() == "true"
+    WEBSOCKET_PROXY_TIMEOUT_SECONDS = int(os.getenv("WEBSOCKET_PROXY_TIMEOUT_SECONDS", "30"))
 
 
 class TestConfig(Config):
@@ -52,3 +60,4 @@ class TestConfig(Config):
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(minutes=5)
     JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=1)
     RATE_LIMIT_REQUESTS = 1000
+    RATE_LIMIT_EXEMPT_PATHS = ()

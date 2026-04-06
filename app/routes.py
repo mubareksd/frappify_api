@@ -4,11 +4,12 @@ from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from fnmatch import fnmatchcase
 from http.cookies import SimpleCookie
+from threading import Event, Thread
 from typing import Tuple
 from urllib.parse import urlparse
 
 import requests
-from flask import Blueprint, Response, g, jsonify, request
+from flask import Blueprint, Response, current_app, g, jsonify, request
 from flask_jwt_extended import (
     create_access_token,
     create_refresh_token,
@@ -17,6 +18,7 @@ from flask_jwt_extended import (
     verify_jwt_in_request,
 )
 from sqlalchemy.exc import IntegrityError, OperationalError
+from websocket import WebSocketConnectionClosedException, create_connection
 
 from .auth import (
     generate_email_verification_token,
@@ -27,7 +29,7 @@ from .auth import (
     verify_password_reset_token,
 )
 from .cookies import get_valid_cookie_by_id, store_cookie
-from .extensions import db
+from .extensions import db, sock
 from .models import Cookie, IpFilter, Log, Site, User
 
 
@@ -48,6 +50,11 @@ FRAPPE_LOGIN_PATHS = {
     "/v1/method/login",
     "/v2/method/login",
 }
+ALLOWED_WEBSOCKET_PREFIXES = (
+    "/socket.io",
+    "/ws",
+    "/websocket",
+)
 
 
 def _serialize_site(site: Site) -> dict:
@@ -128,6 +135,37 @@ def _is_frappe_login_path(path: str) -> bool:
 def _is_asset_proxy_path(path: str) -> bool:
     normalized_path = f"/{path.lstrip('/')}"
     return normalized_path == "/assets" or normalized_path.startswith("/assets/")
+
+
+def _is_allowed_websocket_path(path: str) -> bool:
+    normalized_path = f"/{path.lstrip('/')}"
+    for prefix in ALLOWED_WEBSOCKET_PREFIXES:
+        if normalized_path == prefix or normalized_path.startswith(f"{prefix}/"):
+            return True
+    return False
+
+
+def _extract_client_ip() -> str:
+    forwarded = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+    return forwarded.split(",")[0].strip()
+
+
+def _is_ip_allowed(site: Site, client_ip: str) -> bool:
+    if not site.enable_ip_filter:
+        return True
+
+    if not client_ip:
+        return False
+
+    ip_filter_mode = site.ip_filter_mode or "whitelist"
+    ip_filter_exists = any(
+        (_matches_filter_pattern(client_ip, ip_filter.ip_address) for ip_filter in site.ip_filters)
+    )
+    if ip_filter_mode == "whitelist":
+        return ip_filter_exists
+    if ip_filter_mode == "blacklist":
+        return not ip_filter_exists
+    return False
 
 
 def _matches_filter_pattern(value: str, pattern: str, *, case_sensitive: bool = True) -> bool:
@@ -650,18 +688,11 @@ def proxy_request(path: str):
         return jsonify({"error": "Site not found"}), HTTPStatus.NOT_FOUND
     g.log_site_id = site.id
     
-    if site.enable_ip_filter:
-        client_ip=request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
-        if not client_ip:
-            return jsonify({"error": "Unable to determine client IP address"}), HTTPStatus.BAD_REQUEST
-
-        ip_filter_mode = site.ip_filter_mode or "whitelist"
-        ip_filter_exists = any(
-            (_matches_filter_pattern(client_ip, ip_filter.ip_address) for ip_filter in site.ip_filters)
-        )
-
-        if (ip_filter_mode == "whitelist" and not ip_filter_exists) or (ip_filter_mode == "blacklist" and ip_filter_exists):
-            return jsonify({"error": "Access denied due to IP filter rules"}), HTTPStatus.FORBIDDEN
+    client_ip = _extract_client_ip()
+    if site.enable_ip_filter and not client_ip:
+        return jsonify({"error": "Unable to determine client IP address"}), HTTPStatus.BAD_REQUEST
+    if not _is_ip_allowed(site, client_ip):
+        return jsonify({"error": "Access denied due to IP filter rules"}), HTTPStatus.FORBIDDEN
 
     proxied_path = path.lstrip("/")
     if _is_asset_proxy_path(path):
@@ -719,3 +750,120 @@ def proxy_request(path: str):
         status=upstream_response.status_code,
         headers=response_headers,
     )
+
+
+@sock.route("/api/ws/<path:path>")
+def proxy_websocket_connection(ws, path: str):
+    if not current_app.config.get("WEBSOCKET_PROXY_ENABLED", True):
+        ws.close()
+        return
+
+    if not _is_allowed_websocket_path(path):
+        ws.close()
+        return
+
+    target_site_id = request.headers.get("X-Frappe-Site")
+    if not target_site_id:
+        ws.close()
+        return
+
+    site = Site.query.filter_by(site_id=target_site_id).first()
+    if site is None:
+        ws.close()
+        return
+
+    client_ip = _extract_client_ip()
+    if site.enable_ip_filter and not client_ip:
+        ws.close()
+        return
+    if not _is_ip_allowed(site, client_ip):
+        ws.close()
+        return
+
+    proxied_path = path.lstrip("/")
+    parsed_base = urlparse(site.base_url)
+    upstream_scheme = "wss" if parsed_base.scheme == "https" else "ws"
+    upstream_url = f"{upstream_scheme}://{parsed_base.netloc}/{proxied_path}"
+    if request.query_string:
+        upstream_url = f"{upstream_url}?{request.query_string.decode()}"
+
+    excluded_headers = {"host", "connection", "upgrade", "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions", "x-frappe-site", "content-length"}
+    upstream_headers = [
+        f"{key}: {value}"
+        for key, value in request.headers.items()
+        if key.lower() not in excluded_headers
+    ]
+
+    authorization_header = request.headers.get("Authorization")
+    if authorization_header and authorization_header.startswith("Bearer "):
+        try:
+            verify_jwt_in_request()
+            identity = get_jwt_identity()
+            if identity is None:
+                ws.close()
+                return
+            cookie = get_valid_cookie_by_id(site.id, int(identity))
+            if cookie is None:
+                ws.close()
+                return
+            upstream_headers.append(f"Cookie: {cookie.cookie_name}={cookie.cookie_value}")
+        except Exception:
+            ws.close()
+            return
+
+    try:
+        upstream_ws = create_connection(
+            upstream_url,
+            header=upstream_headers,
+            timeout=current_app.config.get("WEBSOCKET_PROXY_TIMEOUT_SECONDS", 30),
+            enable_multithread=True,
+        )
+    except Exception:
+        ws.close()
+        return
+
+    stop_event = Event()
+
+    def client_to_upstream() -> None:
+        try:
+            while not stop_event.is_set():
+                message = ws.receive()
+                if message is None:
+                    break
+                if isinstance(message, bytes):
+                    upstream_ws.send_binary(message)
+                else:
+                    upstream_ws.send(message)
+        except Exception:
+            pass
+        finally:
+            stop_event.set()
+
+    def upstream_to_client() -> None:
+        try:
+            while not stop_event.is_set():
+                message = upstream_ws.recv()
+                if message is None:
+                    break
+                ws.send(message)
+        except (WebSocketConnectionClosedException, OSError):
+            pass
+        finally:
+            stop_event.set()
+
+    to_upstream = Thread(target=client_to_upstream, daemon=True)
+    to_client = Thread(target=upstream_to_client, daemon=True)
+    to_upstream.start()
+    to_client.start()
+    to_upstream.join()
+    to_client.join()
+
+    try:
+        upstream_ws.close()
+    except Exception:
+        pass
+
+    try:
+        ws.close()
+    except Exception:
+        pass
