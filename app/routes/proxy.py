@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 
 import requests
@@ -93,7 +93,12 @@ def proxy_request(path: str):
 
         expires_delta = timedelta(days=7)
         if expires_at:
-            expires_delta = expires_at - datetime.utcnow()
+            normalized_expires_at = expires_at
+            if normalized_expires_at.tzinfo is None:
+                normalized_expires_at = normalized_expires_at.replace(tzinfo=UTC)
+            expires_delta = max(
+                normalized_expires_at - datetime.now(UTC), timedelta(seconds=0)
+            )
         access_token = create_access_token(identity=str(cookie_id), expires_delta=expires_delta)
         return jsonify({"access_token": access_token, "expires_in": expires_delta.total_seconds()})
 

@@ -1,10 +1,12 @@
 from http import HTTPStatus
 
-from flask import g, jsonify, request
+from flask import current_app, g, jsonify, request
 from flask_jwt_extended import get_jwt_identity, jwt_required
 from sqlalchemy.exc import IntegrityError
+from werkzeug.exceptions import BadRequest
 
 from ..extensions import db
+from ..health_monitor import ensure_recent_health_check, health_summary, run_site_health_check
 from ..models import IpFilter, Log, Site
 from . import api_bp
 from .utils import (
@@ -148,10 +150,22 @@ def list_sites():
         query = query.order_by(sort_column.desc(), Site.id.desc())
 
     sites = query.offset(offset).limit(page_size).all()
+
+    uptime_window_days = int(request.args.get("uptime_days") or 0)
+    if uptime_window_days <= 0:
+        uptime_window_days = int(current_app.config.get("SITE_HEALTH_UPTIME_WINDOW_DAYS", 90))
+
+    serialized_sites = []
+    for site in sites:
+        ensure_recent_health_check(site)
+        site_data = serialize_site(site)
+        site_data["health"] = health_summary(site.id, days=uptime_window_days)
+        serialized_sites.append(site_data)
+
     return (
         jsonify(
             {
-                "sites": [serialize_site(site) for site in sites],
+                "sites": serialized_sites,
                 "meta": {
                     "page": page,
                     "page_size": page_size,
@@ -161,6 +175,7 @@ def list_sites():
                     "sort_dir": sort_dir,
                     "search": search,
                     "enable_ip_filter": enable_ip_filter,
+                    "uptime_days": uptime_window_days,
                 },
             }
         ),
@@ -172,7 +187,10 @@ def list_sites():
 @jwt_required()
 def create_site():
     user_id = int(get_jwt_identity())
-    payload = request.get_json(silent=False)
+    try:
+        payload = request.get_json(silent=False)
+    except BadRequest:
+        return jsonify({"error": "Invalid JSON body"}), HTTPStatus.BAD_REQUEST
     if payload is None:
         return jsonify({"error": "Invalid JSON body"}), HTTPStatus.BAD_REQUEST
     if not isinstance(payload, dict):
@@ -213,7 +231,9 @@ def create_site():
     db.session.commit()
     g.log_site_id = site.id
 
-    return jsonify({"site": serialize_site(site)}), HTTPStatus.CREATED
+    site_data = serialize_site(site)
+    site_data["health"] = health_summary(site.id)
+    return jsonify({"site": site_data}), HTTPStatus.CREATED
 
 
 @api_bp.put("/sites/<string:site_id>")
@@ -248,7 +268,9 @@ def update_site(site_id: str):
     db.session.commit()
     g.log_site_id = site.id
 
-    return jsonify({"site": serialize_site(site)}), HTTPStatus.OK
+    site_data = serialize_site(site)
+    site_data["health"] = health_summary(site.id)
+    return jsonify({"site": site_data}), HTTPStatus.OK
 
 
 @api_bp.delete("/sites/<string:site_id>")
@@ -264,3 +286,31 @@ def delete_site(site_id: str):
     db.session.commit()
 
     return jsonify({"message": "Site deleted successfully"}), HTTPStatus.OK
+
+
+@api_bp.post("/sites/<string:site_id>/health-check")
+@jwt_required()
+def run_site_health_check_for_user(site_id: str):
+    user_id = int(get_jwt_identity())
+    site = Site.query.filter_by(site_id=site_id, user_id=user_id).first()
+    if site is None:
+        return jsonify({"error": "Site not found"}), HTTPStatus.NOT_FOUND
+
+    result = run_site_health_check(site)
+    return (
+        jsonify(
+            {
+                "site_id": site.site_id,
+                "health_check": {
+                    "id": result.id,
+                    "is_up": result.is_up,
+                    "status_code": result.status_code,
+                    "response_time_ms": result.response_time_ms,
+                    "error_message": result.error_message,
+                    "checked_at": result.checked_at.isoformat(),
+                },
+                "health": health_summary(site.id),
+            }
+        ),
+        HTTPStatus.OK,
+    )

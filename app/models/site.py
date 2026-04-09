@@ -29,3 +29,6 @@ class Site(TimestampMixin, db.Model):
     ip_filters = db.relationship(
         "IpFilter", back_populates="site", cascade="all, delete-orphan"
     )
+    health_checks = db.relationship(
+        "SiteHealthCheck", back_populates="site", cascade="all, delete-orphan"
+    )

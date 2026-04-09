@@ -1,6 +1,6 @@
 from flask_jwt_extended import create_access_token
 
-from app.models import Log, Site, User
+from app.models import Log, Site, SiteHealthCheck, User
 
 
 def create_user(session, username: str) -> User:
@@ -164,7 +164,68 @@ def test_site_routes_store_request_response_logs(app, client, session):
     assert log_entry.method == "POST"
     assert log_entry.path == "/api/sites"
     assert log_entry.response_status == 201
-    assert log_entry.site_id == created_site["site_id"]
+    assert log_entry.site_id == created_site["id"]
     assert log_entry.user_id == user.id
     assert log_entry.headers["X-Test-Header"] == "site-log-check"
     assert log_entry.timestamp is not None
+
+
+def test_list_sites_includes_health_summary(app, client, session):
+    user = create_user(session, "healthlist")
+    site = Site(site_id="C00021", base_url="https://health.example.com", user_id=user.id)
+    session.add(site)
+    session.commit()
+
+    session.add(
+        SiteHealthCheck(
+            site_id=site.id,
+            is_up=True,
+            status_code=200,
+            response_time_ms=120,
+            error_message=None,
+        )
+    )
+    session.commit()
+
+    response = client.get("/api/sites", headers=auth_headers(app, user.id))
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data["sites"]) == 1
+    health = data["sites"][0]["health"]
+    assert health["window_days"] == 90
+    assert health["checks"] == 1
+    assert health["up_checks"] == 1
+    assert health["uptime_percentage"] == 100.0
+    assert health["current_status"] == "up"
+
+
+def test_manual_health_check_endpoint_persists_result(app, client, session, monkeypatch):
+    class MockResponse:
+        status_code = 200
+
+    def fake_get(*args, **kwargs):
+        return MockResponse()
+
+    monkeypatch.setattr("app.health_monitor.requests.get", fake_get)
+
+    user = create_user(session, "healthrun")
+    site = Site(site_id="C00022", base_url="https://health-run.example.com", user_id=user.id)
+    session.add(site)
+    session.commit()
+
+    response = client.post(
+        f"/api/sites/{site.site_id}/health-check",
+        headers=auth_headers(app, user.id),
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["site_id"] == site.site_id
+    assert payload["health"]["current_status"] == "up"
+    assert payload["health"]["checks"] >= 1
+
+    saved = session.query(SiteHealthCheck).filter_by(site_id=site.id).all()
+    assert len(saved) == 1
+    assert saved[0].is_up is True
+    assert saved[0].status_code == 200

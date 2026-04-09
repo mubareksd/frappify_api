@@ -13,24 +13,36 @@ from .routes import api_bp
 def create_app(config_object: type[Config] = Config) -> Flask:
     app = Flask(__name__)
     app.config.from_object(config_object)
-    
+
+    def _apply_cors_headers(response):
+        origin = request.headers.get("Origin", "*")
+        requested_headers = request.headers.get(
+            "Access-Control-Request-Headers",
+            "Authorization, Content-Type",
+        )
+
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin, Access-Control-Request-Headers"
+        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = requested_headers
+        response.headers["Access-Control-Max-Age"] = "86400"
+        return response
+
     @app.before_request
     def handle_preflight():
         if request.method == "OPTIONS":
-            return ("", 204)
-    
+            return _apply_cors_headers(app.response_class(status=204))
+
     @app.after_request
     def add_cors_headers(resp):
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-        return resp
+        return _apply_cors_headers(resp)
 
     register_extensions(app)
     register_rate_limiting(app)
     register_request_logging(app)
     register_blueprints(app)
     
-    
+
     @app.errorhandler(404)
     def not_found(e):
         return '', 404

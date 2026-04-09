@@ -52,7 +52,7 @@ def test_proxy_forwards_request_to_frappe_site(client, session, monkeypatch):
             {"Content-Type": "application/json", "X-Upstream": "frappe"},
         )
 
-    monkeypatch.setattr("app.routes.requests.request", fake_request)
+    monkeypatch.setattr("app.routes.proxy.requests.request", fake_request)
 
     response = client.post(
         "/api/resource/ToDo?limit=5",
@@ -98,7 +98,7 @@ def test_proxy_attaches_cookie_for_valid_proxy_token(client, session, monkeypatc
         captured_request["headers"] = headers
         return MockUpstreamResponse(b"cookie attached", 200, {"Content-Type": "text/plain"})
 
-    monkeypatch.setattr("app.routes.requests.request", fake_request)
+    monkeypatch.setattr("app.routes.proxy.requests.request", fake_request)
 
     response = client.get(
         "/api/method/frappe.auth.get_logged_user",
@@ -143,7 +143,7 @@ def test_proxy_login_stores_returned_session_cookie(client, session, monkeypatch
             },
         )
 
-    monkeypatch.setattr("app.routes.requests.request", fake_request)
+    monkeypatch.setattr("app.routes.proxy.requests.request", fake_request)
 
     response = client.post(
         "/api/method/login",
@@ -180,7 +180,7 @@ def test_proxy_login_stores_expired_session_as_unusable_cookie(client, session, 
             },
         )
 
-    monkeypatch.setattr("app.routes.requests.request", fake_request)
+    monkeypatch.setattr("app.routes.proxy.requests.request", fake_request)
 
     response = client.post(
         "/api/v1/method/login",
@@ -206,7 +206,7 @@ def test_proxy_routes_store_request_response_logs(client, session, monkeypatch):
             {"Content-Type": "application/json"},
         )
 
-    monkeypatch.setattr("app.routes.requests.request", fake_request)
+    monkeypatch.setattr("app.routes.proxy.requests.request", fake_request)
 
     response = client.get(
         "/api/resource/DocType",
@@ -223,7 +223,7 @@ def test_proxy_routes_store_request_response_logs(client, session, monkeypatch):
     assert log_entry.method == "GET"
     assert log_entry.path == "/api/resource/DocType"
     assert log_entry.response_status == 207
-    assert log_entry.site_id == site.site_id
+    assert log_entry.site_id == site.id
     assert log_entry.user_id is None
     assert log_entry.headers["X-Frappe-Site"] == site.site_id
     assert log_entry.headers["X-Test-Header"] == "proxy-log-check"
