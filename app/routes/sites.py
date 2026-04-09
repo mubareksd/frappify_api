@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from werkzeug.exceptions import BadRequest
 
 from ..extensions import db
-from ..health_monitor import ensure_recent_health_check, health_summary, run_site_health_check
+from ..health_monitor import health_summary, run_site_health_check, sites_health_overview
 from ..models import IpFilter, Log, Site
 from . import api_bp
 from .utils import (
@@ -157,7 +157,6 @@ def list_sites():
 
     serialized_sites = []
     for site in sites:
-        ensure_recent_health_check(site)
         site_data = serialize_site(site)
         site_data["health"] = health_summary(site.id, days=uptime_window_days)
         serialized_sites.append(site_data)
@@ -177,6 +176,28 @@ def list_sites():
                     "enable_ip_filter": enable_ip_filter,
                     "uptime_days": uptime_window_days,
                 },
+            }
+        ),
+        HTTPStatus.OK,
+    )
+
+
+@api_bp.get("/sites/overview")
+@jwt_required()
+def sites_overview():
+    user_id = int(get_jwt_identity())
+
+    uptime_window_days = int(request.args.get("uptime_days") or 0)
+    if uptime_window_days <= 0:
+        uptime_window_days = int(current_app.config.get("SITE_HEALTH_UPTIME_WINDOW_DAYS", 90))
+
+    return (
+        jsonify(
+            {
+                "overview": sites_health_overview(
+                    user_id=user_id,
+                    days=uptime_window_days,
+                )
             }
         ),
         HTTPStatus.OK,
@@ -229,6 +250,17 @@ def create_site():
             site.ip_filters.append(IpFilter(ip_address=ip))
 
     db.session.commit()
+
+    if current_app.config.get("SITE_HEALTH_CHECK_ON_CREATE", True):
+        try:
+            run_site_health_check(site)
+        except Exception:
+            db.session.rollback()
+            current_app.logger.exception(
+                "Initial site health check failed",
+                extra={"site_id": site.site_id},
+            )
+
     g.log_site_id = site.id
 
     site_data = serialize_site(site)
@@ -286,31 +318,3 @@ def delete_site(site_id: str):
     db.session.commit()
 
     return jsonify({"message": "Site deleted successfully"}), HTTPStatus.OK
-
-
-@api_bp.post("/sites/<string:site_id>/health-check")
-@jwt_required()
-def run_site_health_check_for_user(site_id: str):
-    user_id = int(get_jwt_identity())
-    site = Site.query.filter_by(site_id=site_id, user_id=user_id).first()
-    if site is None:
-        return jsonify({"error": "Site not found"}), HTTPStatus.NOT_FOUND
-
-    result = run_site_health_check(site)
-    return (
-        jsonify(
-            {
-                "site_id": site.site_id,
-                "health_check": {
-                    "id": result.id,
-                    "is_up": result.is_up,
-                    "status_code": result.status_code,
-                    "response_time_ms": result.response_time_ms,
-                    "error_message": result.error_message,
-                    "checked_at": result.checked_at.isoformat(),
-                },
-                "health": health_summary(site.id),
-            }
-        ),
-        HTTPStatus.OK,
-    )

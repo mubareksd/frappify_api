@@ -1,5 +1,6 @@
 from flask_jwt_extended import create_access_token
 
+from app.health_monitor import run_due_health_checks
 from app.models import Log, Site, SiteHealthCheck, User
 
 
@@ -58,6 +59,35 @@ def test_create_site_adds_new_site_for_logged_in_user(app, client, session):
 
     saved_site = session.query(Site).filter_by(site_id="C00001").one()
     assert saved_site.user_id == user.id
+
+
+def test_create_site_runs_health_check_immediately_when_enabled(app, client, session, monkeypatch):
+    class MockResponse:
+        status_code = 200
+
+    def fake_get(*args, **kwargs):
+        return MockResponse()
+
+    app.config["SITE_HEALTH_CHECK_ON_CREATE"] = True
+    monkeypatch.setattr("app.health_monitor.requests.get", fake_get)
+
+    user = create_user(session, "createcheck")
+    response = client.post(
+        "/api/sites",
+        headers=auth_headers(app, user.id),
+        json={"base_url": "https://created-check.example.com"},
+    )
+
+    assert response.status_code == 201
+    created_site = response.get_json()["site"]
+    health = created_site["health"]
+    assert health["checks"] == 1
+    assert health["current_status"] == "up"
+
+    saved_site = session.query(Site).filter_by(site_id=created_site["site_id"]).one()
+    saved_checks = session.query(SiteHealthCheck).filter_by(site_id=saved_site.id).all()
+    assert len(saved_checks) == 1
+    assert saved_checks[0].is_up is True
 
 
 def test_create_site_ignores_client_supplied_site_id(app, client, session):
@@ -200,7 +230,34 @@ def test_list_sites_includes_health_summary(app, client, session):
     assert health["current_status"] == "up"
 
 
-def test_manual_health_check_endpoint_persists_result(app, client, session, monkeypatch):
+def test_sites_overview_returns_total_and_status_counts(app, client, session):
+    user = create_user(session, "healthoverview")
+    up_site = Site(site_id="C00022", base_url="https://up.example.com", user_id=user.id)
+    down_site = Site(site_id="C00023", base_url="https://down.example.com", user_id=user.id)
+    unknown_site = Site(site_id="C00024", base_url="https://unknown.example.com", user_id=user.id)
+    session.add_all([up_site, down_site, unknown_site])
+    session.commit()
+
+    session.add_all(
+        [
+            SiteHealthCheck(site_id=up_site.id, is_up=True, status_code=200, response_time_ms=90),
+            SiteHealthCheck(site_id=down_site.id, is_up=False, status_code=503, response_time_ms=250),
+        ]
+    )
+    session.commit()
+
+    response = client.get("/api/sites/overview", headers=auth_headers(app, user.id))
+
+    assert response.status_code == 200
+    overview = response.get_json()["overview"]
+    assert overview["total_sites"] == 3
+    assert overview["up_sites"] == 1
+    assert overview["down_sites"] == 1
+    assert overview["unknown_sites"] == 1
+    assert len(overview["sites"]) == 3
+
+
+def test_run_due_health_checks_persists_result_for_stale_sites(app, session, monkeypatch):
     class MockResponse:
         status_code = 200
 
@@ -214,18 +271,17 @@ def test_manual_health_check_endpoint_persists_result(app, client, session, monk
     session.add(site)
     session.commit()
 
-    response = client.post(
-        f"/api/sites/{site.site_id}/health-check",
-        headers=auth_headers(app, user.id),
-    )
+    with app.app_context():
+        checked_sites = run_due_health_checks()
 
-    assert response.status_code == 200
-    payload = response.get_json()
-    assert payload["site_id"] == site.site_id
-    assert payload["health"]["current_status"] == "up"
-    assert payload["health"]["checks"] >= 1
+    assert checked_sites == 1
 
     saved = session.query(SiteHealthCheck).filter_by(site_id=site.id).all()
     assert len(saved) == 1
     assert saved[0].is_up is True
     assert saved[0].status_code == 200
+
+    with app.app_context():
+        checked_sites = run_due_health_checks()
+
+    assert checked_sites == 0

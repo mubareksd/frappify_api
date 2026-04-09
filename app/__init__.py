@@ -4,6 +4,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from .config import Config
 from .extensions import bcrypt, cors, db, jwt, mail, migrate, sock
+from .health_monitor import start_health_monitor
 from . import models
 from .models import Log
 from .rate_limiter import rate_limiter
@@ -41,6 +42,7 @@ def create_app(config_object: type[Config] = Config) -> Flask:
     register_rate_limiting(app)
     register_request_logging(app)
     register_blueprints(app)
+    start_health_monitor(app)
     
 
     @app.errorhandler(404)
